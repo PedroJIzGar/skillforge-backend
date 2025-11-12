@@ -1,0 +1,129 @@
+name: Auto branch from issue
+
+on:
+  issues:
+    types: [opened, labeled, edited]
+
+permissions:
+  contents: write         # para crear la rama (ref)
+  issues: write           # para comentar el issue
+  pull-requests: write    # para crear PR (opcional)
+
+jobs:
+  create-branch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Decide branch type by label
+        id: decide
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issue = context.payload.issue;
+            const labels = issue.labels.map(l => l.name);
+
+            // Mapea label -> prefijo de rama
+            let prefix = null;
+            if (labels.includes('type: feature')) prefix = 'feature';
+            else if (labels.includes('type: bug')) prefix = 'fix';
+            else if (labels.includes('type: task')) prefix = 'chore';
+            else if (labels.includes('type: spike')) prefix = 'spike';
+
+            if (!prefix) {
+              core.notice('No se encontró un label de tipo (type: feature|bug|task|spike). No se creará rama.');
+              return;
+            }
+
+            // slug a partir del título del issue
+            const slug = issue.title
+              .toLowerCase()
+              .replace(/[^a-z0-9\s-]/g, '')
+              .trim()
+              .replace(/\s+/g, '-')
+              .slice(0, 40);
+
+            const branch = `${prefix}/${issue.number}-${slug || 'task'}`;
+            core.setOutput('branch', branch);
+
+      - name: Get default branch SHA
+        if: steps.decide.outputs.branch
+        uses: actions/github-script@v7
+        id: base
+        with:
+          script: |
+            const { data: repo } = await github.rest.repos.get(context.repo);
+            const defaultBranch = repo.default_branch;
+            const { data: ref } = await github.rest.git.getRef({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: `heads/${defaultBranch}`
+            });
+            core.setOutput('sha', ref.object.sha);
+            core.setOutput('default', defaultBranch);
+
+      - name: Create branch
+        if: steps.decide.outputs.branch
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const branch = core.getInput('branch', { required: false }) || '${{ steps.decide.outputs.branch }}';
+            const sha = '${{ steps.base.outputs.sha }}';
+            try {
+              await github.rest.git.createRef({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: `refs/heads/${branch}`,
+                sha
+              });
+            } catch (e) {
+              if (e.status === 422) {
+                core.notice(`La rama ${branch} ya existe; continúo.`);
+              } else {
+                throw e;
+              }
+            }
+
+      - name: Comment issue with branch link
+        if: steps.decide.outputs.branch
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issue_number = context.payload.issue.number;
+            const branch = '${{ steps.decide.outputs.branch }}';
+            const url = `https://github.com/${context.repo.owner}/${context.repo.repo}/tree/${branch}`;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number,
+              body: `✅ Rama creada: **\`${branch}\`**\n\n${url}`
+            });
+
+      # (OPCIONAL) Crear PR en borrador automáticamente
+      - name: Create draft PR
+        if: steps.decide.outputs.branch
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const branch = '${{ steps.decide.outputs.branch }}';
+            const { data: repo } = await github.rest.repos.get(context.repo);
+            const base = repo.default_branch;
+            const issue = context.payload.issue;
+
+            // Comprueba si ya hay PR abierto desde esa rama
+            const { data: prs } = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              head: `${context.repo.owner}:${branch}`,
+              state: 'open'
+            });
+            if (prs.length === 0) {
+              const pr = await github.rest.pulls.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                head: branch,
+                base,
+                draft: true,
+                title: `${issue.title} (#{issue.number})`,
+                body: `Closes #${issue.number}`
+              });
+              // vincular PR con issue (body ya incluye closes #n)
+            }
