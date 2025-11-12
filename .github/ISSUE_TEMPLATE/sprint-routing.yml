@@ -1,0 +1,33 @@
+name: Sprint routing
+on:
+  issues:
+    types: [opened, labeled]
+permissions:
+  issues: write
+jobs:
+  route:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set milestone by Sprint label
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issue = context.payload.issue;
+            const sprintLabel = issue.labels.find(l => /^Sprint: \d+$/.test(l.name));
+            if (!sprintLabel) return;
+            const sprintNum = sprintLabel.name.split(':')[1].trim();
+            const milestoneTitle = `Sprint ${sprintNum}`;
+            const { data: milestones } = await github.rest.issues.listMilestones({
+              owner: context.repo.owner, repo: context.repo.repo, state: 'open'
+            });
+            let milestone = milestones.find(m => m.title === milestoneTitle);
+            if (!milestone) {
+              const created = await github.rest.issues.createMilestone({
+                owner: context.repo.owner, repo: context.repo.repo, title: milestoneTitle
+              });
+              milestone = created.data;
+            }
+            await github.rest.issues.update({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: issue.number, milestone: milestone.number
+            });
